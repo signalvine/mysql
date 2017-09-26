@@ -1,5 +1,6 @@
 {-# LANGUAGE OverloadedStrings          #-}
 
+import Control.Concurrent
 import Control.Exception     (bracket)
 import Database.MySQL.Base   (ConnectInfo (..), defaultConnectInfo, Option (..),
                               connect, close,
@@ -12,6 +13,7 @@ testConn :: ConnectInfo
 testConn = defaultConnectInfo {
                connectHost     = "127.0.0.1",
                connectUser     = "test",
+               connectPassword = "test",
                connectDatabase = "test",
                connectOptions  = [
                    InitCommand "SET SESSION sql_mode = 'STRICT_ALL_TABLES';"
@@ -27,6 +29,7 @@ main :: IO ()
 main = bracket (connect testConn) close $ \conn -> hspec $ do
     describe "Database" $ do
       it "seems to be connected" $ do
+        myThreadId >>= threadCapability >>= print
         query conn "select 1 + 1"
         result <- useResult conn
         row <- fetchRow result

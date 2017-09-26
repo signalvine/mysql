@@ -1,4 +1,4 @@
-{-# LANGUAGE DeriveDataTypeable, ForeignFunctionInterface, RecordWildCards #-}
+{-# LANGUAGE BangPatterns, DeriveDataTypeable, ForeignFunctionInterface, RecordWildCards, ScopedTypeVariables #-}
 
 -- |
 -- Module:      Database.MySQL.Base
@@ -85,8 +85,10 @@ module Database.MySQL.Base
     ) where
 
 import Control.Applicative ((<$>), (<*>))
+import Control.Concurrent
+import Control.Concurrent.Async
 import Control.Exception (Exception, throw)
-import Control.Monad (forM_, unless, when)
+import Control.Monad (forM, forM_, unless, when)
 import Data.ByteString.Char8 ()
 import Data.ByteString.Internal (ByteString, create, createAndTrim, memcpy)
 import Data.ByteString.Unsafe (unsafeUseAsCStringLen)
@@ -105,6 +107,7 @@ import Foreign.Marshal.Array (peekArray)
 import Foreign.Ptr (Ptr, castPtr, nullPtr)
 import System.IO.Unsafe (unsafePerformIO)
 import System.Mem.Weak (Weak, deRefWeak, mkWeakPtr)
+import System.Random
 
 -- $license
 --
@@ -271,41 +274,65 @@ defaultSSLInfo = SSLInfo {
 -- | Connect to a database.
 connect :: ConnectInfo -> IO Connection
 connect ConnectInfo{..} = do
-  closed <- newIORef False
-  ptr0 <- mysql_init nullPtr
-  case connectSSL of
-    Nothing -> return ()
-    Just SSLInfo{..} -> withString sslKey $ \ckey ->
-                         withString sslCert $ \ccert ->
-                          withString sslCA $ \cca ->
-                           withString sslCAPath $ \ccapath ->
-                            withString sslCiphers $ \ccipher ->
-                             mysql_ssl_set ptr0 ckey ccert cca ccapath ccipher
-                             >> return ()
-  forM_ connectOptions $ \opt -> do
-    r <- mysql_options ptr0 opt
-    unless (r == 0) $ connectionError_ "connect" ptr0
-  let flags = foldl' (+) 0 . map toConnectFlag $ connectOptions
-  ptr <- withString connectHost $ \chost ->
-          withString connectUser $ \cuser ->
-           withString connectPassword $ \cpass ->
-            withString connectDatabase $ \cdb ->
-             withString connectPath $ \cpath ->
-               mysql_real_connect ptr0 chost cuser cpass cdb
-                                  (fromIntegral connectPort) cpath flags
-  when (ptr == nullPtr) $
-    connectionError_ "connect" ptr0
-  res <- newIORef Nothing
-  let realClose = do
-        cleanupConnResult res
-        wasClosed <- atomicModifyIORef closed $ \prev -> (True, prev)
-        unless wasClosed $ mysql_close ptr
-  fp <- newForeignPtr ptr realClose
-  return Connection {
-               connFP = fp
-             , connClose = realClose
-             , connResult = res
-             }
+  -- Make a bunch of busy threads so that yielding has a high chance of getting
+  -- our test thread rescheduled onto a different capability. This is hacky and
+  -- fragile, since there's no reason to want to do this if you're not demoing
+  -- a concurrency bug.
+  let spin :: Int -> IO ()
+      spin !n = do
+        rand :: Int <- randomRIO (1, 100)
+        threadDelay $ 1000 * rand
+        spin (n + 1)
+  spinHandles <- forM [0 :: Int .. 100] $ const $ async $ spin 0
+
+  testHandle <- async $ do
+    closed <- newIORef False
+    -- To trigger the bug, mysql_init and mysql_real_connect must run on
+    -- different capabilities.
+    tid <- myThreadId
+    (cap, _) <- threadCapability tid
+    ptr0 <- mysql_init nullPtr
+    -- Loop, checking the current capability, until we're rescheduled onto a
+    -- different one.
+    let loop = do
+          (cap', _) <- threadCapability tid
+          when (cap == cap') (threadDelay 50000 >> loop)
+      in loop
+    case connectSSL of
+      Nothing -> return ()
+      Just SSLInfo{..} -> withString sslKey $ \ckey ->
+                          withString sslCert $ \ccert ->
+                            withString sslCA $ \cca ->
+                            withString sslCAPath $ \ccapath ->
+                              withString sslCiphers $ \ccipher ->
+                              mysql_ssl_set ptr0 ckey ccert cca ccapath ccipher
+                              >> return ()
+    forM_ connectOptions $ \opt -> do
+      r <- mysql_options ptr0 opt
+      unless (r == 0) $ connectionError_ "connect" ptr0
+    let flags = foldl' (+) 0 . map toConnectFlag $ connectOptions
+    ptr <- withString connectHost $ \chost ->
+            withString connectUser $ \cuser ->
+            withString connectPassword $ \cpass ->
+              withString connectDatabase $ \cdb ->
+              withString connectPath $ \cpath ->
+                mysql_real_connect ptr0 chost cuser cpass cdb
+                                    (fromIntegral connectPort) cpath flags
+    when (ptr == nullPtr) $
+      connectionError_ "connect" ptr0
+    res <- newIORef Nothing
+    let realClose = do
+          cleanupConnResult res
+          wasClosed <- atomicModifyIORef closed $ \prev -> (True, prev)
+          unless wasClosed $ mysql_close ptr
+    fp <- newForeignPtr ptr realClose
+    return Connection {
+                connFP = fp
+              , connClose = realClose
+              , connResult = res
+              }
+  mapM_ cancel spinHandles
+  wait testHandle
 
 -- | Delete the 'MYSQL_RES' behind a 'Result' immediately, and mark
 -- the 'Result' as invalid.

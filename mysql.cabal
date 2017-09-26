@@ -49,8 +49,10 @@ library
 
   build-depends:
     base       < 5,
+    async,
     bytestring >= 0.9 && < 1.0,
-    containers
+    containers,
+    random
 
   ghc-options: -Wall
   if impl(ghc >= 6.8)
@@ -64,7 +66,7 @@ test-suite test
     type:            exitcode-stdio-1.0
     main-is:         main.hs
     hs-source-dirs:  test
-    ghc-options:     -Wall
+    ghc-options:     -Wall -threaded -rtsopts -with-rtsopts=-N
     build-depends:   base                    >= 4 && < 5
                    , bytestring
                    , hspec
