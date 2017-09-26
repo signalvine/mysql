@@ -85,6 +85,7 @@ module Database.MySQL.Base
     ) where
 
 import Control.Applicative ((<$>), (<*>))
+import Control.Concurrent (runInBoundThread)
 import Control.Exception (Exception, throw)
 import Control.Monad (forM_, unless, when)
 import Data.ByteString.Char8 ()
@@ -296,7 +297,12 @@ connect ConnectInfo{..} = do
   when (ptr == nullPtr) $
     connectionError_ "connect" ptr0
   res <- newIORef Nothing
-  let realClose = do
+  let realClose = runInBoundThread $ do
+        -- In general, the user of this library is responsible for dealing with
+        -- thread safety. However, the programmer has no control over the OS
+        -- thread finalizers are run from so we use 'runInBoundThread' and
+        -- 'initThread' here.
+        initThread
         cleanupConnResult res
         wasClosed <- atomicModifyIORef closed $ \prev -> (True, prev)
         unless wasClosed $ mysql_close ptr
